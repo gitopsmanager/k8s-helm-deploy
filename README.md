@@ -251,6 +251,23 @@ The ArgoCD application `<namespace>-<app>` points at `overlays/<target_environme
 
 ---
 
+## 📊 Collection of Usage Metrics
+
+Each run sends a small JSON payload over HTTPS to [gitopsmanager.io/github-action-metrics](https://gitopsmanager.io/github-action-metrics). A failed report never fails the run.
+
+```json
+{
+  "action": "deploy",
+  "org": "<your GitHub organization>",
+  "repo": "<your repository>",
+  "timestamp": "2026-11-10T12:00:00Z"
+}
+```
+
+The organization and repository names are hashed on receipt (HMAC-SHA256 with a secret key). Only the hashes are stored, and only totals — organizations, repositories, builds and deploys — are published on [gitopsmanager.io](https://gitopsmanager.io). No source code, credentials or personal data are sent.
+
+---
+
 ## 📜 License
 
 MIT. See [LICENSE](LICENSE) and [THIRD-PARTY-ACTIONS-AND-TOOLS.md](THIRD-PARTY-ACTIONS-AND-TOOLS.md).
