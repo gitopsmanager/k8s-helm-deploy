@@ -1,0 +1,551 @@
+# deploy.yaml
+# Copyright (c) 2026 GitOps Manager, S.L.
+# Version: v1 (reusable, Helm render → CD repo → ArgoCD)
+# SPDX-License-Identifier: MIT
+#
+# Renders a Helm chart from the caller's repo with `helm template`, commits
+# the rendered manifests to the CD repo and syncs them with ArgoCD. Helm is
+# a build tool here only: nothing is `helm install`ed, the CD repo commit is
+# the record of what is deployed, and rollback is a revert of that commit.
+#
+# Inputs mirror gitopsmanager/k8s-deploy, minus overlay_dir and
+# kustomize_version. The CD repo layout is the same as k8s-deploy's, with
+# target_environment as the overlay dir, so ArgoCD-Manage-Applications and
+# k8s-restore-cluster work unchanged.
+
+on:
+  workflow_call:
+    inputs:
+      github_runner:
+        description: >
+          A bare runner name, or a JSON array of runner labels.
+        required: true
+        type: string
+      namespace:
+        required: true
+        type: string
+      target_environment:
+        description: >
+          The environment to deploy to (e.g., `dev`, `qa`, `prod`).
+
+          - Selects `values-<target_environment>.yaml` from the chart folder, if present.
+          - If the environment maps to **multiple clusters** in `env_map`, you must also set `target_cluster`.
+        required: true
+        default: "dev"
+        type: string
+
+      # REQUIRED when env has >1 clusters
+      target_cluster:
+        description: >
+          The specific cluster to deploy to when the selected target_environment
+          has more than one cluster in `env_map`. Leave empty for single-cluster
+          environments.
+
+          `values-<env>-<cluster>.yaml` is applied for the resolved cluster, whether
+          it was given here or resolved from `env_map`.
+        required: false
+        default: ""
+        type: string
+
+      # Only consulted when the environment holds clusters in more than one cloud
+      target_cloud:
+        description: >
+          Which cloud to deploy to (`aws` or `azure`) when the selected
+          target_environment holds clusters in more than one cloud. Leave empty
+          and the runner's own cloud decides. Ignored when `target_cluster` is given.
+        required: false
+        default: ""
+        type: string
+      ref:
+        description: >
+          The git ref to check out. For a chart kept in the repo this is the
+          chart version: promote by deploying the same ref and image_tag to
+          the next environment.
+        required: false
+        type: string
+        default: ${{ github.ref || github.sha }}
+      delete_first:
+        description: "Delete the namespaced app first before deploying it."
+        required: false
+        type: boolean
+      delete_only:
+        description: "Delete ArgoCD app(s) without redeploying"
+        required: false
+        type: boolean
+        default: false
+      cd_repo:
+        required: true
+        type: string
+      cd_repo_org:
+        required: true
+        type: string
+      github_environment:
+        required: false
+        type: string
+
+      # Mode A (single app)
+      application:
+        description: "Application name. Also used as the Helm release name."
+        required: false
+        type: string
+      deploy_path:
+        description: >
+          Repo path to the Helm chart folder (the folder containing Chart.yaml).
+          Optional `values-<env>.yaml` and `values-<env>-<cluster>.yaml` sit beside
+          the chart's own `values.yaml`.
+        required: false
+        type: string
+        default: Deployments
+      image_tag:
+        description: >
+          Tag applied to every listed image. When empty, the tag comes from
+          the chart's values or its appVersion.
+        required: false
+        type: string
+      image_base_name:
+        description: >
+          Main image. Sets `image.repository` to `<container_registry>/<name>`
+          and `image.tag` to image_tag. Use `name=key` for a different values
+          key, e.g. `repo/app=app.image`.
+        required: false
+        type: string
+      image_base_names:
+        description: >
+          Further images, comma-separated, each optionally `name=key`,
+          e.g. `repo/sidecar=sidecar.image`. A plain name uses the key `image`.
+        required: false
+        type: string
+
+      # Mode B (multi app)
+      application_details:
+        description: >-
+          JSON array where each item maps:
+          { "name" => application, "images" => image_base_names[], "path" => chart folder }
+          Image entries take the same optional `name=key` form.
+          Example:
+          [
+            {"name":"app1","images":["repo/app1","repo/sidecar=sidecar.image"],"path":"charts/app1"},
+            {"name":"app2","images":["repo/app2"],"path":"charts/app2"}
+          ]
+        required: false
+        type: string
+        default: ''
+
+      # Environment map (single supported shape)
+      env_map:
+        description: >-
+          ONLY this JSON shape is supported:
+          {
+            "<env>": {
+              "cluster_count": N,
+              "clusters": [
+                { "cluster": "...", "dns_zone": "...", "container_registry": "...", "uami_map": [...] }
+              ]
+            }
+          }
+        required: false
+        type: string
+
+      # Helm
+      helm_version:
+        description: "Helm version to install, e.g. v3.17.0"
+        required: false
+        type: string
+        default: "v3.17.0"
+
+      # Argo / misc
+      argocd_auth_token:
+        required: false
+        type: string
+      argocd_username:
+        required: false
+        type: string
+      argocd_password:
+        required: false
+        type: string
+      skip_status_check:
+        required: false
+        default: false
+        type: boolean
+      insecure_argo:
+        required: false
+        default: false
+        type: boolean
+      debug:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CONTINUOUS_DEPLOYMENT_GH_APP_ID:
+        required: true
+      CONTINUOUS_DEPLOYMENT_GH_APP_PRIVATE_KEY:
+        required: true
+      ARGOCD_CA_CERT:
+        required: false
+      ARGOCD_USERNAME:
+        required: false
+      ARGOCD_PASSWORD:
+        required: false
+
+jobs:
+  deploy:
+    name: >-
+      ${{ inputs.target_environment }}${{ inputs.target_cluster != '' && format(' - {0}', inputs.target_cluster) || '' }}
+    # Accepts EITHER a bare runner name or a JSON array of labels; see the
+    # same expression in gitopsmanager/k8s-deploy for why it is built this way.
+    runs-on: ${{ fromJSON(startsWith(inputs.github_runner, '[') && inputs.github_runner || format('["{0}"]', inputs.github_runner)) }}
+    environment: ${{ inputs.github_environment }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    outputs:
+      cd_path: ${{ steps.env.outputs.cd_root }}
+    steps:
+    - name: Checkout repo
+      if: ${{ inputs.delete_only == false }}
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+        repository: ${{ github.repository }}
+        path: source
+        ref: ${{ inputs.ref }}
+
+    - name: Report usage metrics (non-blocking)
+      uses: actions/github-script@v9
+      continue-on-error: true
+      timeout-minutes: 0.5
+      env:
+        USAGE_ENDPOINT: https://gitopsmanager.io/github-action-metrics
+      with:
+        script: |
+          const endpoint = process.env.USAGE_ENDPOINT;
+          const [org, repo] = (process.env.GITHUB_REPOSITORY || "").split("/");
+          const payload = { org, repo, action: "deploy", timestamp: new Date().toISOString() };
+
+          core.info(`📊 Sending metrics: ${JSON.stringify(payload)}`);
+          try {
+            const resp = await fetch(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            const text = await resp.text();
+            if (resp.ok) core.info(`✅ Usage metrics reported (${resp.status}).`);
+            else core.warning(`⚠️ Metrics report failed: HTTP ${resp.status} ${text}`);
+          } catch (err) {
+            core.warning(`❌ Metrics request threw: ${err.message}`);
+          }
+
+    - name: Generate GitHub App token
+      id: generate_token
+      uses: actions/create-github-app-token@v3
+      with:
+        app-id: ${{ secrets.CONTINUOUS_DEPLOYMENT_GH_APP_ID }}
+        private-key: ${{ secrets.CONTINUOUS_DEPLOYMENT_GH_APP_PRIVATE_KEY }}
+        owner: ${{ inputs.cd_repo_org }}
+        repositories: ${{ inputs.cd_repo }}
+
+    - name: Checkout continuous-deployment repo
+      uses: actions/checkout@v6
+      with:
+        repository: ${{ inputs.cd_repo_org }}/${{ inputs.cd_repo }}
+        token: ${{ steps.generate_token.outputs.token }}
+        path: continuous-deployment
+
+    - name: Detect cloud
+      id: cloud
+      if: ${{ inputs.delete_only == false }}
+      uses: gitopsmanager/detect-cloud@v1
+      with:
+        timeout-ms: 800
+
+    - name: Warn if GitHub-hosted (unknown cloud)
+      if: ${{ steps.cloud.outputs.provider == 'unknown' && inputs.delete_only == false }}
+      run: |
+        echo "⚠️ Running on a GitHub-hosted runner."
+        echo "Workload Identity mappings for AWS/Azure self-hosted runners will not apply."
+
+    - name: Import ENV_MAP from runner
+      shell: bash
+      run: |
+        printf "ENV_MAP<<EOF\n%s\nEOF\n" "$ENV_MAP" >> $GITHUB_ENV
+
+    - name: Load Environment Config
+      id: env
+      uses: gitopsmanager/k8s-load-env@v1
+      env:
+        ENV_MAP: ${{ env.ENV_MAP }}
+      with:
+        env_map: ${{ inputs.env_map }}
+        target_environment: ${{ inputs.target_environment }}
+        target_cluster: ${{ inputs.target_cluster }}
+        target_cloud: ${{ inputs.target_cloud }}
+        namespace: ${{ inputs.namespace }}
+
+    - name: Debug env outputs
+      run: |
+        echo "cluster='${{ steps.env.outputs.cluster }}'"
+        echo "cloud='${{ steps.env.outputs.cloud }}'"
+        echo "dns_zone='${{ steps.env.outputs.dns_zone }}'"
+        echo "container_registry='${{ steps.env.outputs.container_registry }}'"
+        echo "cd_root='${{ steps.env.outputs.cd_root }}'"
+
+    # Unify to a single apps[] list for either mode
+    - name: Resolve apps (single or multi)
+      id: apps
+      uses: actions/github-script@v9
+      env:
+        APP_DETAILS: ${{ inputs.application_details }}
+        APPLICATION: ${{ inputs.application }}
+        DEPLOY_PATH: ${{ inputs.deploy_path }}
+        IMG_ONE: ${{ inputs.image_base_name }}
+        IMG_LIST: ${{ inputs.image_base_names }}
+      with:
+        script: |
+          const detailsRaw = (process.env.APP_DETAILS || '').trim();
+          let apps = [];
+
+          if (detailsRaw) {
+            let arr;
+            try { arr = JSON.parse(detailsRaw); }
+            catch (e) { core.setFailed(`❌ application_details is not valid JSON: ${e.message}`); return; }
+
+            if (!Array.isArray(arr)) {
+              core.info('application_details is a single object → wrapping in an array');
+              arr = [arr];
+            }
+
+            for (let i = 0; i < arr.length; i++) {
+              const it = arr[i] || {};
+              const name = String(it.name || '').trim();
+              const path = String(it.path || '').trim();
+              const images = Array.isArray(it.images) ? it.images.map(s => String(s).trim()).filter(Boolean) : [];
+
+              if (!name) { core.setFailed(`❌ application_details[${i}].name is required`); return; }
+              if (!path) { core.setFailed(`❌ application_details[${i}].path is required`); return; }
+
+              apps.push({ name, path, images });
+            }
+          } else {
+            const name = (process.env.APPLICATION || '').trim();
+            const path = (process.env.DEPLOY_PATH || '').trim();
+            const images = [];
+
+            if ((process.env.IMG_ONE || '').trim()) images.push(process.env.IMG_ONE.trim());
+            for (const s of (process.env.IMG_LIST || '').split(',').map(x => x.trim()).filter(Boolean)) {
+              images.push(s);
+            }
+
+            if (!name) { core.setFailed('❌ application is required when application_details is not provided'); return; }
+            if (!path) { core.setFailed('❌ deploy_path is required when application_details is not provided'); return; }
+
+            apps.push({ name, path, images });
+          }
+
+          // Image entries are `name` or `name=key`; check the key here so a
+          // typo fails before anything is rendered.
+          for (const app of apps) {
+            for (const entry of app.images) {
+              const eq = entry.indexOf('=');
+              const key = eq === -1 ? 'image' : entry.slice(eq + 1).trim();
+              const img = eq === -1 ? entry : entry.slice(0, eq).trim();
+              if (!img) { core.setFailed(`❌ App '${app.name}': image entry '${entry}' has no image name`); return; }
+              if (!/^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/.test(key)) {
+                core.setFailed(`❌ App '${app.name}': '${key}' in '${entry}' is not a valid values key (expected e.g. image or sidecar.image)`);
+                return;
+              }
+            }
+          }
+
+          core.setOutput('apps', JSON.stringify(apps));
+          core.setOutput('count', String(apps.length));
+
+    - name: Setup Helm
+      if: ${{ inputs.delete_only == false }}
+      uses: azure/setup-helm@v4
+      with:
+        version: ${{ inputs.helm_version }}
+
+    - name: Render charts with Helm into CD repo
+      id: render
+      if: ${{ inputs.delete_only == false }}
+      uses: actions/github-script@v9
+      env:
+        APPS: ${{ steps.apps.outputs.apps }}
+        CLUSTER_NAME: ${{ steps.env.outputs.cluster }}
+        TARGET_ENV: ${{ inputs.target_environment }}
+        NAMESPACE: ${{ inputs.namespace }}
+        CONTAINER_REGISTRY: ${{ steps.env.outputs.container_registry }}
+        IMAGE_TAG: ${{ inputs.image_tag }}
+        CD_REPO: ${{ inputs.cd_repo }}
+        CD_REPO_ORG: ${{ inputs.cd_repo_org }}
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          const { execFileSync } = require('child_process');
+
+          const apps = JSON.parse(process.env.APPS || '[]');
+          const cluster = process.env.CLUSTER_NAME;
+          const env = process.env.TARGET_ENV;
+          const namespace = process.env.NAMESPACE;
+          const registry = (process.env.CONTAINER_REGISTRY || '').replace(/\/+$/, '');
+          const imageTag = (process.env.IMAGE_TAG || '').trim();
+
+          if (!cluster) { core.setFailed('❌ Cluster name not resolved from environment config'); return; }
+
+          // Same layout as k8s-deploy: <cluster>/<ns>/<app>/overlays/<overlay_dir>.
+          // ArgoCD-Manage-Applications always points the Argo app there, so
+          // the environment name takes the place of overlay_dir.
+          const cdRootRel = path.join(cluster, namespace);
+          const cdRoot = path.join('continuous-deployment', cdRootRel);
+
+          function helm(args, cwd) {
+            core.info(`$ helm ${args.join(' ')}`);
+            try {
+              return execFileSync('helm', args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+            } catch (e) {
+              throw new Error(`helm ${args[0]} failed:\n${e.stderr || e.message}`);
+            }
+          }
+
+          for (const app of apps) {
+            core.startGroup(`📦 ${app.name} (chart: ${app.path})`);
+            const chartDir = path.join('source', app.path);
+
+            if (!fs.existsSync(path.join(chartDir, 'Chart.yaml'))) {
+              core.setFailed(`❌ App '${app.name}': no Chart.yaml in ${app.path}. deploy_path / application_details[].path must be the chart folder.`);
+              return;
+            }
+
+            // Dependencies declared in Chart.yaml must be fetched before
+            // rendering. This is also how a third-party chart is deployed: a
+            // wrapper chart that depends on it. `build` honours Chart.lock;
+            // `update` resolves fresh. HTTP chart repos must be registered
+            // first or `build` refuses them; oci:// and file:// need nothing.
+            const chartYaml = fs.readFileSync(path.join(chartDir, 'Chart.yaml'), 'utf8');
+            if (/^dependencies:/m.test(chartYaml)) {
+              const repos = [...chartYaml.matchAll(/^\s*repository:\s*["']?(https?:\/\/[^"'\s]+)/gm)].map(m => m[1]);
+              [...new Set(repos)].forEach((url, i) => helm(['repo', 'add', `dep-${app.name}-${i}`, url, '--force-update']));
+              const lock = fs.existsSync(path.join(chartDir, 'Chart.lock'));
+              helm(['dependency', lock ? 'build' : 'update', chartDir]);
+            }
+
+            const args = ['template', app.name, chartDir,
+              '--namespace', namespace, '--include-crds', '--skip-tests'];
+
+            // Values layering: the chart's own values.yaml is always loaded
+            // by Helm; env then cluster files override it when present.
+            for (const f of [`values-${env}.yaml`, `values-${env}-${cluster}.yaml`]) {
+              const p = path.join(chartDir, f);
+              if (fs.existsSync(p)) { args.push('-f', p); core.info(`🧩 values: ${f}`); }
+              else core.info(`· no ${f}`);
+            }
+
+            // The registry is per cluster, so the chart cannot know it: the
+            // repository is always set; the tag only when one was given.
+            for (const entry of app.images) {
+              const eq = entry.indexOf('=');
+              const img = (eq === -1 ? entry : entry.slice(0, eq)).trim();
+              const key = eq === -1 ? 'image' : entry.slice(eq + 1).trim();
+              const repo = registry ? `${registry}/${img}` : img;
+              args.push('--set-string', `${key}.repository=${repo}`);
+              if (imageTag) args.push('--set-string', `${key}.tag=${imageTag}`);
+              core.info(`🖼️ ${key} → ${repo}${imageTag ? ':' + imageTag : ' (tag from chart)'}`);
+            }
+
+            const rendered = helm(args);
+            if (!rendered.trim()) { core.setFailed(`❌ App '${app.name}': helm template produced no output`); return; }
+
+            // Secrets are never committed to the CD repo: they reach the
+            // cluster only through a secrets operator, whose resources
+            // (ExternalSecret, SealedSecret, SecretProviderClass) hold
+            // references or ciphertext and pass. A plain Secret carrying
+            // values would be committed in plain text, so it always fails.
+            const secretDocs = rendered.split(/^---\s*$/m).filter(d =>
+              /^kind:\s*Secret\s*$/m.test(d) && /^(data|stringData):/m.test(d));
+            if (secretDocs.length) {
+              const names = secretDocs.map(d => (d.match(/^\s+name:\s*(\S+)/m) || [])[1] || '?');
+              core.setFailed(`❌ App '${app.name}': rendered output contains Secret(s) with data: ${names.join(', ')}. ` +
+                `They would be committed to the CD repo in plain text. Supply secrets through a secrets ` +
+                `operator (e.g. an ExternalSecret), or point the chart at an existing secret (e.g. existingSecret).`);
+              return;
+            }
+
+            const appDir = path.join(cdRoot, app.name);
+            const outDir = path.join(appDir, 'overlays', env);
+            fs.rmSync(appDir, { recursive: true, force: true });
+            fs.mkdirSync(outDir, { recursive: true });
+            fs.writeFileSync(path.join(outDir, 'manifests.yaml'), rendered, 'utf8');
+
+            // Read by k8s-restore-cluster to recreate the Argo app.
+            const createJson = {
+              cluster,
+              namespace,
+              overlay_dir: env,
+              applications: [{
+                name: app.name,
+                repo: `https://github.com/${process.env.CD_REPO_ORG}/${process.env.CD_REPO}`,
+                path: app.path
+              }]
+            };
+            fs.writeFileSync(path.join(appDir, 'create.json'), JSON.stringify(createJson, null, 2));
+
+            // Copy for the run artifact.
+            const artDir = path.join('rendered', app.name);
+            fs.mkdirSync(artDir, { recursive: true });
+            fs.writeFileSync(path.join(artDir, 'manifests.yaml'), rendered, 'utf8');
+
+            core.info(`✅ Wrote ${path.join(outDir, 'manifests.yaml')}`);
+            core.endGroup();
+          }
+
+          core.setOutput('cd_path', cdRoot);
+          core.setOutput('cd_path_rel', cdRootRel);
+
+    - name: Upload rendered manifests
+      if: ${{ always() && inputs.delete_only == false }}
+      uses: actions/upload-artifact@v6
+      with:
+        name: rendered-manifests-${{ steps.env.outputs.cluster }}-${{ fromJSON(steps.apps.outputs.apps)[0].name }}
+        path: rendered
+        if-no-files-found: ignore
+
+    - name: Debug structure
+      if: ${{ inputs.debug && inputs.delete_only == false }}
+      run: find "${{ steps.render.outputs.cd_path }}" || echo "Nothing rendered!"
+
+    - name: Commit and squash-merge changes
+      uses: gitopsmanager/Auto-Commit-Squash-Merge@v1
+      with:
+        token: ${{ steps.generate_token.outputs.token }}
+        repo_owner: ${{ inputs.cd_repo_org }}
+        repo_name: ${{ inputs.cd_repo }}
+        namespace: ${{ inputs.namespace }}
+        cluster: ${{ steps.env.outputs.cluster }}
+        app_name: ${{ fromJSON(steps.apps.outputs.apps)[0].name }}
+        repo_path_rel: ${{ steps.render.outputs.cd_path_rel || format('{0}/{1}', steps.env.outputs.cluster, inputs.namespace) }}
+        delete_only: ${{ inputs.delete_only }}
+
+    - name: Construct ArgoCD URL
+      id: build_argo_url
+      run: |
+        echo "url=https://${{ steps.env.outputs.cluster }}-argocd-argocd-web-ui.${{ steps.env.outputs.dns_zone }}" >> $GITHUB_OUTPUT
+
+    - name: Manage ArgoCD Applications
+      uses: gitopsmanager/ArgoCD-Manage-Applications@v1
+      with:
+        argocd_url: ${{ steps.build_argo_url.outputs.url }}
+        argocd_auth_token: ${{ inputs.argocd_auth_token }}
+        argocd_username: ${{ secrets.ARGOCD_USERNAME }}
+        argocd_password: ${{ secrets.ARGOCD_PASSWORD }}
+        insecure_argo: ${{ inputs.insecure_argo }}
+        argocd_ca_cert: ${{ secrets.ARGOCD_CA_CERT }}
+        namespace: ${{ inputs.namespace }}
+        cd_repo: ${{ inputs.cd_repo }}
+        cd_path_rel: ${{ steps.render.outputs.cd_path_rel || format('{0}/{1}', steps.env.outputs.cluster, inputs.namespace) }}
+        cd_repo_org: ${{ inputs.cd_repo_org }}
+        overlay_dir: ${{ inputs.target_environment }}
+        apps: ${{ steps.apps.outputs.apps }}
+        delete_first: ${{ inputs.delete_first }}
+        delete_only: ${{ inputs.delete_only }}
+        skip_status_check: ${{ inputs.skip_status_check }}
